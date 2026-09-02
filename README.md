@@ -2,6 +2,8 @@
 
 Mindflow は、ブラウザだけで使えるシンプルなマインドマップです。アカウント登録やサーバーは不要で、入力した内容はブラウザのローカルストレージに保存されます。
 
+**公開版:** https://mindflow-mvp.tishikawa-com.workers.dev/
+
 ## できること
 
 - テーマと子ノードの追加
@@ -22,7 +24,11 @@ python3 -m http.server 4173 --directory public
 
 その後、`http://localhost:4173` を開きます。
 
-## Cloudflare Pages
+## Cloudflareへ公開
+
+現在の公開版はCloudflare Workersで配信しています。静的ファイルだけで構成されているため、同じリポジトリをCloudflare Pagesへ接続して自動デプロイすることもできます。
+
+Cloudflare Pagesへ接続する場合の設定:
 
 - フレームワーク: なし
 - ビルドコマンド: なし
