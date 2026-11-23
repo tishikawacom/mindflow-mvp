@@ -1,0 +1,4 @@
+# Cloudflare static asset security headers
+/*
+  Referrer-Policy: no-referrer
+  X-Content-Type-Options: nosniff
