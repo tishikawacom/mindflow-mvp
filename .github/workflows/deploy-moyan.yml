@@ -1,0 +1,46 @@
+name: Deploy moyan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'moyan/**'
+      - '.github/workflows/deploy-moyan.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: moyan-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: node --check moyan/app.js
+      - name: Deploy static assets
+        id: cloudflare
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: moyan
+          wranglerVersion: '4.50.0'
+          command: deploy
+      - name: Verify and report public URL
+        env:
+          DEPLOYMENT_URL: ${{ steps.cloudflare.outputs.deployment-url }}
+        run: |
+          test -n "$DEPLOYMENT_URL"
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors "$DEPLOYMENT_URL" -o /tmp/moyan-index.html
+          grep -Fq '<title>moyan' /tmp/moyan-index.html
+          printf '## moyan\n\n%s\n' "$DEPLOYMENT_URL" >> "$GITHUB_STEP_SUMMARY"
