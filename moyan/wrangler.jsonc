@@ -18,5 +18,6 @@
       "database_name": "moyan-sync",
       "database_id": "13ca7a6e-f1b8-4544-8acf-514860d67a29"
     }
-  ]
+  ],
+  "keep_vars": true
 }
