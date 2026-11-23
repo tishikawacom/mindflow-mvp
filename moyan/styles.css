@@ -43,3 +43,5 @@ button,[role="button"]{touch-action:manipulation}
  .bar-col{min-width:0;height:122px}
  .bar-col span,.bar-col em{text-align:center;white-space:normal;line-height:1.2;overflow-wrap:anywhere}
 }
+
+.btn[href]{color:white;text-decoration:none}

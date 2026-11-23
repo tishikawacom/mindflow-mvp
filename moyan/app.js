@@ -15,25 +15,144 @@ let storageReadable=true;
 function load(){try{const raw=localStorage.getItem(KEY);const value=raw?JSON.parse(raw):initial();if(!Array.isArray(value?.events)||value.events.some(e=>!Array.isArray(e?.predictions)||!Array.isArray(e.sessions)||!Array.isArray(e.actions)))throw Error('bad data');return value}catch{storageReadable=false;alert('保存データを読み込めませんでした。既存データは上書きせず、表示を初期状態にします。');return initial()}}
 let db=load(),view='home',selected=null,modalTrigger=null;
 function persist(){try{localStorage.setItem(KEY,JSON.stringify(db));return true}catch{alert('保存に失敗しました。ストレージの空き容量やプライベートブラウズ設定を確認してください。');return false}}
+let account=null, configured=false, checking=false, saving=false, syncMessage='';
+const timerKey= scope=>KEY+'-timer-'+scope;
+function readAccountTimer(scope){
+ try{return JSON.parse(sessionStorage.getItem(timerKey(scope)))}
+ catch{return null}
+}
+function rememberAccountTimer(timer){
+ try{
+  if(timer)sessionStorage.setItem(timerKey(account.scope),JSON.stringify(timer));
+  else sessionStorage.removeItem(timerKey(account.scope));
+ }catch{}
+}
+const loginResult=new URLSearchParams(location.search).get('login');
+if(loginResult){
+ history.replaceState(null,'',location.pathname);
+ view='settings';
+ if(loginResult==='failed')syncMessage='Googleログインを完了できませんでした。もう一度お試しください。';
+}
+async function refreshAccount(interactive=false){
+ if(checking||saving||!$('#modal').hidden)return;
+ checking=true;
+ try{
+  const response=await fetch('/api/journal',{cache:'no-store',signal:AbortSignal.timeout(6000)});
+  if(!response.ok)throw Error('read');
+  const remote=await response.json();
+  if(typeof remote.configured!=='boolean'||!$('#modal').hidden)return;
+  configured=remote.configured;
+  if(remote.signedIn){
+   const sameAccount=account?.scope===remote.scope;
+   const timer=sameAccount?db.timer:readAccountTimer(remote.scope);
+   if(!sameAccount||!remote.events.some(e=>e.id===selected))selected=null;
+   account={scope:remote.scope,revision:remote.revision};
+   db={version:1,events:remote.events,timer:remote.events.some(e=>e.id===timer?.eventId)?timer:null};
+  }else if(account){
+   account=null;
+   selected=null;
+   db=load();
+  }
+  if(interactive)syncMessage=remote.signedIn?'最新の記録を取得しました。':'';
+  updatePrivacyLabel();
+  if($('#modal').hidden)render();
+ }catch{
+  if(interactive){syncMessage='記録を取得できませんでした。接続を確認してください。';render()}
+ }finally{checking=false}
+}
+
 function commit(update){
- if(!storageReadable){
+ if(account&&(checking||saving)){
+  alert('同期中です。少し待ってからもう一度お試しください。');
+  return false;
+ }
+ if(!account&&!storageReadable){
   alert('既存の保存データを保護するため、この画面からは変更できません。');
   return false;
  }
  const previous=JSON.stringify(db);
  const previousView=view;
  const previousSelection=selected;
- update();
- if(!persist()){
+ const restore=()=>{
   db=JSON.parse(previous);
   view=previousView;
   selected=previousSelection;
   hideModal();
   render();
-  return false;
+ };
+ update();
+ if(!account){
+  if(!persist()){restore();return false}
+ }else if(previous!==JSON.stringify(db)){
+  if(JSON.stringify(JSON.parse(previous).events)!==JSON.stringify(db.events)){
+   saveAccount(restore);
+  }else rememberAccountTimer(db.timer);
  }
  render();
  return true;
+}
+
+async function saveAccount(restore){
+ saving=true;
+ syncMessage='同期しています…';
+ try{
+  const response=await fetch('/api/journal',{
+   method:'PUT',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({...account,events:db.events}),
+   signal:AbortSignal.timeout(8000)
+  });
+  if(!response.ok){
+   if(response.status===409)throw Error('conflict');
+   if(response.status===401)throw Error('session');
+   throw Error('save');
+  }
+  account.revision=(await response.json()).revision;
+  rememberAccountTimer(db.timer);
+  syncMessage='同期しました。';
+  if(view==='settings'&&$('#modal').hidden)render();
+ }catch(error){
+  syncMessage=error.message==='conflict'?'別の端末またはタブで記録が更新されました。最新の記録を取得してから入力し直してください。'
+   :error.message==='session'?'ログインの有効期限が切れました。再読み込みしてからログインしてください。'
+   :'同期を確認できませんでした。最新の記録を取得してから、変更が反映されたか確認してください。';
+  restore();
+  alert(syncMessage);
+ }finally{saving=false}
+}
+
+function updatePrivacyLabel(){
+ const label=$('#storageLabel');
+ if(label)label.textContent=account?'Googleアカウントで同期':'記録はこの端末だけに保存';
+}
+
+async function logout(){
+ if(saving||checking)return;
+ checking=true;
+ try{
+  const response=await fetch('/api/auth/logout',{method:'POST'});
+  if(!response.ok)throw Error('logout');
+  rememberAccountTimer(null);
+  location.replace('/');
+ }catch{checking=false;alert('ログアウトできませんでした。接続を確認してください。')}
+}
+
+function importLocal(){
+ if(!account||!storageReadable)return;
+ const local=load().events;
+ if(!storageReadable)return;
+ if(!local.length){syncMessage='取り込める端末内の記録はありません。';render();return}
+ if(!confirm('この端末の記録をアカウントにコピーし、Cloudflareに保存しますか？'))return;
+ const known=new Set(db.events.map(e=>e.id));
+ commit(()=>{db.events.push(...local.filter(e=>!known.has(e.id)))});
+}
+
+function accountSettings(){
+ const controls=account
+  ? '<button class="btn ghost" id="refreshAccount">最新の記録を取得</button><button class="btn ghost" id="importLocal">端末内の記録を取り込む</button><button class="btn ghost" id="logoutAccount">ログアウト</button>'
+  : configured
+   ? '<a class="btn" href="/api/auth/login">Googleでログイン</a>'
+   : '<p class="small">Googleログインは現在利用できません。</p>';
+ return `<h2>アカウントと同期</h2><p class="small">${account?'Googleでログイン中です。アカウントの記録はCloudflareに保存され、同じアカウントでログインした端末から使えます。':'ログインせずに使えます。Googleでログインすると、そのアカウントで作成した記録が別の端末でも使えるようになります。同期する記録はCloudflareに保存されます。'} 未ログイン時の記録は、ログイン後に取り込みを選ぶまで端末内に残ります。</p><div class="btn-row">${controls}</div><p role="status" class="small">${safe(syncMessage)}</p><hr>`;
 }
 const durationOf=e=>e.sessions.reduce((s,x)=>s+x.minutes,0);
 const actionsTotal=e=>e.actions.reduce((s,a)=>s+a.minutes,0);
@@ -49,8 +168,8 @@ function detail(e){const tm=durationOf(e),action=actionsTotal(e),effective=e.act
 function timerBlock(e){const t=db.timer;if(!t)return '';if(t.eventId!==e.id)return `<div class="note">別の不安でタイマーが動作中です。そちらで終了してから使えます。</div>`;const secs=Math.floor((Date.now()-new Date(t.startedAt).getTime())/1000);return `<div class="timer-live"><div><small>反芻タイマー記録中</small><strong id="timerClock">${clock(Math.max(0,secs))}</strong></div><button class="btn sm" id="stopTimer">終了して確認</button></div>`}
 const clock=s=>`${String(Math.floor(s/3600)).padStart(2,'0')}:${String(Math.floor(s%3600/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
 function insights(){const es=db.events;const rum=es.reduce((s,e)=>s+durationOf(e),0);const act=es.reduce((s,e)=>s+actionsTotal(e),0);const useful=es.reduce((s,e)=>s+e.actions.filter(a=>a.review?.reuse===true).reduce((r,a)=>r+a.minutes,0),0);const preds=es.flatMap(e=>e.predictions);const counts={yes:0,partial:0,no:0,unknown:0};preds.forEach(p=>{if(counts[p.outcome]!==undefined)counts[p.outcome]++});const byCat=categories.map(c=>({name:c,minutes:es.filter(e=>e.category===c).reduce((s,e)=>s+durationOf(e),0)})).filter(x=>x.minutes>0);const max=Math.max(1,...byCat.map(x=>x.minutes));return page(['心配の傾向を、少しずつ知る。','数値は自分を評価するためではなく、次の行動を選びやすくするためのものです。'],`<div class="three-col"><div class="card"><div class="stat-label">反芻に使った時間</div><div class="stat-num">${fmt(rum)}</div><div class="stat-hint">概算を含む累計</div></div><div class="card"><div class="stat-label">実行した行動の時間</div><div class="stat-num">${fmt(act)}</div><div class="stat-hint">準備・練習・相談など</div></div><div class="card"><div class="stat-label">次回も使いたい行動</div><div class="stat-num">${fmt(useful)}</div><div class="stat-hint">イベント後の自己評価</div></div></div><div class="two-col" style="margin-top:18px"><div class="card"><h2>波及効果の現実化</h2><p class="small">予測ごとに、実際の結果を集計しています。</p><div style="display:grid;gap:12px;margin-top:23px">${[{key:'yes',name:'起きた',color:'#cf967b'},{key:'partial',name:'一部起きた',color:'#e7bb82'},{key:'no',name:'起きなかった',color:'#77b79c'},{key:'unknown',name:'まだ不明',color:'#becdc5'}].map(x=>`<div><div class="subline"><span>${x.name}</span><strong>${counts[x.key]}件</strong></div><div class="meter"><div style="width:${Math.round(counts[x.key]/Math.max(preds.length,1)*100)}%;background:${x.color}"></div></div></div>`).join('')}</div><p class="muted-line">確認前・判定不能は上記に含めていません。予測が外れたこと自体を成功と決めつけません。</p></div><div class="card"><h2>カテゴリ別の反芻時間</h2><p class="small">どのテーマに時間を使っていたかを確認できます。</p>${byCat.length?`<div class="chart-bars">${byCat.map(x=>`<div class="bar-col"><em>${x.minutes}分</em><div style="height:${Math.max(x.minutes/max*100,2)}%"></div><span>${x.name}</span></div>`).join('')}</div>`:`<div class="empty"><div class="art">▥</div><p>記録が集まると表示されます</p></div>`}</div></div><div class="section-head"><h2>次回に引き継ぎたい行動</h2></div><div class="card">${es.flatMap(e=>e.actions.filter(a=>a.review?.reuse===true).map(a=>({...a,eventTitle:e.title}))).slice(-7).reverse().map(a=>`<div class="list-row"><div><strong>${safe(a.title)}</strong><p>${safe(a.eventTitle)} ・ ${fmt(a.minutes)}</p></div><span class="badge">次回も使いたい</span></div>`).join('')||`<div class="empty"><p>イベント終了後にアクションを評価すると、ここに表示されます。</p></div>`}</div><div class="attention">「役立った時間」は行動についての自己評価であり、結果との因果関係を証明するものではありません。休息や何もしない時間も大切です。</div>`)}
-function settings(){return page(['設定とデータ管理','記録は現在のブラウザ内だけに保存されます。'],`<section class="card"><h2>プライバシー</h2><p class="small">ログイン・クラウド同期・外部AI送信はありません。データはこの端末のブラウザのlocalStorageに保存され、サイトデータの削除や端末変更では失われる場合があります。共有端末での入力は避けてください。</p><div class="btn-row"><button class="btn ghost" id="exportData">記録をJSONで書き出す</button><button class="btn danger" id="clearData">すべての記録を削除</button></div><hr><h2>セルフケアに関する注意</h2><p class="small">moyanは医療機器・診断・治療サービスではありません。不安が長く続く、眠れない、生活に支障が出る場合は医師や心理専門職への相談を検討してください。差し迫った危険がある場合は地域の緊急サービスへ連絡してください。</p></section>`)}
-function render(){setNav();$('#appContent').innerHTML=selected&&view==='worries'&&efind(selected)?detail(efind(selected)):{home,worries,insights,settings}[view]();document.querySelectorAll('[data-open]').forEach(el=>{const open=()=>{selected=el.dataset.open;view='worries';render();window.scrollTo(0,0);$('#appContent').focus({preventScroll:true})};el.onclick=open;if(el.tagName!=='BUTTON')el.onkeydown=ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();open()}}});const bind=(id,fn)=>{const el=$('#'+id);if(el)el.onclick=fn};bind('newWorry',()=>eventForm());bind('emptyNew',()=>eventForm());bind('allWorries',()=>nav('worries'));bind('goInsights',()=>nav('insights'));if(selected&&view==='worries'){const e=efind(selected);bind('backList',()=>{nav('worries')});bind('editWorry',()=>eventForm(e));bind('addPrediction',()=>predictionForm(e));bind('addRumination',()=>rumForm(e));bind('addAction',()=>actionForm(e));bind('startTimer',()=>startTimer(e));bind('stopTimer',()=>stopTimer(e));bind('deleteEvent',()=>{if(confirm('この不安とすべての関連記録を削除しますか？'))commit(()=>{db.events=db.events.filter(x=>x.id!==e.id);if(db.timer?.eventId===e.id)db.timer=null;selected=null})});document.querySelectorAll('[data-review-pred]').forEach(b=>b.onclick=()=>predictionReview(e,b.dataset.reviewPred));document.querySelectorAll('[data-edit-pred]').forEach(b=>b.onclick=()=>predictionForm(e,b.dataset.editPred));document.querySelectorAll('[data-review-action]').forEach(b=>b.onclick=()=>actionReview(e,b.dataset.reviewAction));document.querySelectorAll('[data-edit-action]').forEach(b=>b.onclick=()=>actionForm(e,b.dataset.editAction));document.querySelectorAll('[data-delete-session]').forEach(b=>b.onclick=()=>{if(confirm('この反芻記録を削除しますか？'))commit(()=>e.sessions=e.sessions.filter(x=>x.id!==b.dataset.deleteSession))})}bind('exportData',exportData);bind('clearData',()=>{if(confirm('すべての記録が削除され、元に戻せません。削除しますか？'))commit(()=>{db=initial();selected=null})})}
+function settings(){return page(['設定とデータ管理',account?'アカウントの記録を管理します。':'このブラウザに保存した記録を管理します。'],`<section class="card">${accountSettings()}<h2>プライバシー</h2><p class="small">記録をGoogleに送信することはありません。未ログイン時の記録は、このブラウザのサイトデータを削除すると失われる場合があります。共有端末では利用後にログアウトしてください。</p><div class="btn-row"><button class="btn ghost" id="exportData">記録をJSONで書き出す</button><button class="btn danger" id="clearData">すべての記録を削除</button></div><hr><h2>セルフケアに関する注意</h2><p class="small">moyanは医療機器・診断・治療サービスではありません。不安が長く続く、眠れない、生活に支障が出る場合は医師や心理専門職への相談を検討してください。差し迫った危険がある場合は地域の緊急サービスへ連絡してください。</p></section>`)}
+function render(){setNav();$('#appContent').innerHTML=selected&&view==='worries'&&efind(selected)?detail(efind(selected)):{home,worries,insights,settings}[view]();document.querySelectorAll('[data-open]').forEach(el=>{const open=()=>{selected=el.dataset.open;view='worries';render();window.scrollTo(0,0);$('#appContent').focus({preventScroll:true})};el.onclick=open;if(el.tagName!=='BUTTON')el.onkeydown=ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();open()}}});const bind=(id,fn)=>{const el=$('#'+id);if(el)el.onclick=fn};bind('newWorry',()=>eventForm());bind('emptyNew',()=>eventForm());bind('allWorries',()=>nav('worries'));bind('goInsights',()=>nav('insights'));if(selected&&view==='worries'){const e=efind(selected);bind('backList',()=>{nav('worries')});bind('editWorry',()=>eventForm(e));bind('addPrediction',()=>predictionForm(e));bind('addRumination',()=>rumForm(e));bind('addAction',()=>actionForm(e));bind('startTimer',()=>startTimer(e));bind('stopTimer',()=>stopTimer(e));bind('deleteEvent',()=>{if(confirm('この不安とすべての関連記録を削除しますか？'))commit(()=>{db.events=db.events.filter(x=>x.id!==e.id);if(db.timer?.eventId===e.id)db.timer=null;selected=null})});document.querySelectorAll('[data-review-pred]').forEach(b=>b.onclick=()=>predictionReview(e,b.dataset.reviewPred));document.querySelectorAll('[data-edit-pred]').forEach(b=>b.onclick=()=>predictionForm(e,b.dataset.editPred));document.querySelectorAll('[data-review-action]').forEach(b=>b.onclick=()=>actionReview(e,b.dataset.reviewAction));document.querySelectorAll('[data-edit-action]').forEach(b=>b.onclick=()=>actionForm(e,b.dataset.editAction));document.querySelectorAll('[data-delete-session]').forEach(b=>b.onclick=()=>{if(confirm('この反芻記録を削除しますか？'))commit(()=>e.sessions=e.sessions.filter(x=>x.id!==b.dataset.deleteSession))})}bind('refreshAccount',()=>refreshAccount(true));bind('importLocal',importLocal);bind('logoutAccount',logout);bind('exportData',exportData);bind('clearData',()=>{if(confirm(account?'アカウントの記録をすべて削除しますか？ 同期している端末にも反映されます。':'このブラウザ内の記録をすべて削除しますか？'))commit(()=>{db=initial();selected=null})})}
 function showModal(html,init){modalTrigger=document.activeElement;$('#modalContent').innerHTML=`<div class="modal-head"><h2 id="modalTitle">${html.title}</h2><button class="close" id="closeModal" type="button" aria-label="閉じる">✕</button></div>${html.body}`;$('#modal').hidden=false;$('#closeModal').onclick=hideModal;$('.app').inert=true;document.body.classList.add('modal-open');init?.();$('#modalContent').focus({preventScroll:true})}
 function hideModal(){
   if($('#modal').hidden)return;
@@ -73,4 +192,6 @@ function actionReview(e,id){const a=e.actions.find(x=>x.id===id);if(!a)return;sh
 function exportData(){const blob=new Blob([JSON.stringify(db,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`moyan-backup-${new Date().toISOString().slice(0,10)}.json`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000)}
 setInterval(()=>{if(db.timer){const el=$('#timerClock');if(el)el.textContent=clock(Math.max(0,Math.floor((Date.now()-new Date(db.timer.startedAt).getTime())/1000)))}},1000);
 render();
+refreshAccount();
+window.addEventListener('focus',()=>refreshAccount());
 })();
