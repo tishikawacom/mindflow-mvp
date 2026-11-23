@@ -158,17 +158,39 @@ function accountSettings(){
 const durationOf=e=>e.sessions.reduce((s,x)=>s+x.minutes,0);
 const actionsTotal=e=>e.actions.reduce((s,a)=>s+a.minutes,0);
 const efind=id=>db.events.find(e=>e.id===id);
-function enterView(){
+let pageMotion;
+const views=['home','worries','insights','settings'];
+function enterView(direction=0){
  const content=$('#appContent');
  window.scrollTo(0,0);
  content.focus({preventScroll:true});
+ pageMotion?.cancel();
  if(matchMedia('(prefers-reduced-motion: no-preference)').matches){
-  content.animate([{opacity:0,transform:'translateY(8px)'},{opacity:1,transform:'translateY(0)'}],
-   {duration:260,easing:'cubic-bezier(.2,.8,.2,1)'});
+  const offset=direction?`translateX(${Math.sign(direction)*10}px)`:'translateY(7px)';
+  pageMotion=content.animate(
+   [{opacity:.4,transform:offset},{opacity:1,transform:'translate(0,0)'}],
+   {duration:300,easing:'cubic-bezier(.2,0,0,1)'}
+  );
  }
 }
-function nav(to){if(view===to&&!selected)return;view=to;selected=null;render();enterView();}
-function setNav(){document.querySelectorAll('[data-view]').forEach(b=>{b.classList.toggle('active',b.dataset.view===view);if(b.dataset.view===view)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');b.onclick=()=>nav(b.dataset.view)})}
+function nav(to){
+ if(view===to&&!selected)return;
+ const direction=views.indexOf(to)-views.indexOf(view);
+ view=to;
+ selected=null;
+ render();
+ enterView(direction);
+}
+function setNav(){
+ $('#bottomNav').style.setProperty('--tab',views.indexOf(view));
+ document.querySelectorAll('[data-view]').forEach(button=>{
+  const active=button.dataset.view===view;
+  button.classList.toggle('active',active);
+  if(active)button.setAttribute('aria-current','page');
+  else button.removeAttribute('aria-current');
+  button.onclick=()=>nav(button.dataset.view);
+ });
+}
 function page(heading,body){
  return `<div class="page-intro"><h1 class="page-title">${heading[0]}</h1>${heading[1]?`<p class="sub">${heading[1]}</p>`:''}</div>${body}`;
 }
@@ -186,16 +208,17 @@ function home(){
  const actions=es.reduce((total,e)=>total+actionsTotal(e),0);
  const pending=es.filter(e=>e.predictions.some(awaitingResult));
  const active=efind(db.timer?.eventId);
- return `<section class="hero">
-  <div class="hero-copy"><h1>不安の記録</h1><button class="btn" id="newWorry"><span class="plus" aria-hidden="true"></span>不安を記録</button></div>
+ return `<section class="home-header">
+  <h1>不安の記録</h1>
+  <button class="btn" id="newWorry"><span class="plus" aria-hidden="true"></span>不安を記録</button>
  </section>
  ${active?`<section class="active-timer"><div><span class="small">計測中</span><strong>${safe(active.title)}</strong></div><button class="btn ghost" data-open="${safe(active.id)}">タイマーを開く</button></section>`:''}
  <section class="overview">
   <div class="section-head"><h2>記録の概要</h2><button class="text-btn" id="goInsights">分析を見る<span class="chevron" aria-hidden="true"></span></button></div>
   <div class="overview-grid">
    <div class="metric"><span class="stat-label">不安の記録</span><strong class="stat-num">${es.length}<span class="unit">件</span></strong></div>
-   <div class="metric"><span class="stat-label">反芻した時間</span><strong class="stat-num">${fmt(minutes)}</strong></div>
-   <div class="metric"><span class="stat-label">行動した時間</span><strong class="stat-num">${fmt(actions)}</strong></div>
+   <div class="metric"><span class="stat-label">反芻時間</span><strong class="stat-num">${fmt(minutes)}</strong></div>
+   <div class="metric"><span class="stat-label">行動時間</span><strong class="stat-num">${fmt(actions)}</strong></div>
   </div>
  </section>
  <div class="home-collections">
