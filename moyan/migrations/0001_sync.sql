@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS journals (
+  subject TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL,
+  events TEXT NOT NULL
+);

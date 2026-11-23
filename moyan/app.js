@@ -15,43 +15,223 @@ let storageReadable=true;
 function load(){try{const raw=localStorage.getItem(KEY);const value=raw?JSON.parse(raw):initial();if(!Array.isArray(value?.events)||value.events.some(e=>!Array.isArray(e?.predictions)||!Array.isArray(e.sessions)||!Array.isArray(e.actions)))throw Error('bad data');return value}catch{storageReadable=false;alert('保存データを読み込めませんでした。既存データは上書きせず、表示を初期状態にします。');return initial()}}
 let db=load(),view='home',selected=null,modalTrigger=null;
 function persist(){try{localStorage.setItem(KEY,JSON.stringify(db));return true}catch{alert('保存に失敗しました。ストレージの空き容量やプライベートブラウズ設定を確認してください。');return false}}
+let account=null, configured=false, checking=false, saving=false, syncMessage='';
+let recordTerm='', recordCategory='';
+const timerKey= scope=>KEY+'-timer-'+scope;
+function readAccountTimer(scope){
+ try{return JSON.parse(sessionStorage.getItem(timerKey(scope)))}
+ catch{return null}
+}
+function rememberAccountTimer(timer){
+ try{
+  if(timer)sessionStorage.setItem(timerKey(account.scope),JSON.stringify(timer));
+  else sessionStorage.removeItem(timerKey(account.scope));
+ }catch{}
+}
+const loginResult=new URLSearchParams(location.search).get('login');
+if(loginResult){
+ history.replaceState(null,'',location.pathname);
+ view='settings';
+ if(loginResult==='failed')syncMessage='Googleログインを完了できませんでした。もう一度お試しください。';
+}
+async function refreshAccount(interactive=false){
+ if(checking||saving||!$('#modal').hidden)return;
+ checking=true;
+ try{
+  const response=await fetch('/api/journal',{cache:'no-store',signal:AbortSignal.timeout(6000)});
+  if(!response.ok)throw Error('read');
+  const remote=await response.json();
+  if(typeof remote.configured!=='boolean'||!$('#modal').hidden)return;
+  configured=remote.configured;
+  if(remote.signedIn){
+   const sameAccount=account?.scope===remote.scope;
+   const timer=sameAccount?db.timer:readAccountTimer(remote.scope);
+   if(!sameAccount||!remote.events.some(e=>e.id===selected))selected=null;
+   account={scope:remote.scope,revision:remote.revision};
+   db={version:1,events:remote.events,timer:remote.events.some(e=>e.id===timer?.eventId)?timer:null};
+  }else if(account){
+   account=null;
+   selected=null;
+   db=load();
+  }
+  if(interactive)syncMessage=remote.signedIn?'最新の記録を取得しました。':'';
+  updatePrivacyLabel();
+  if($('#modal').hidden)render();
+ }catch{
+  if(interactive){syncMessage='記録を取得できませんでした。接続を確認してください。';render()}
+ }finally{checking=false}
+}
+
 function commit(update){
- if(!storageReadable){
+ if(account&&(checking||saving)){
+  alert('同期中です。少し待ってからもう一度お試しください。');
+  return false;
+ }
+ if(!account&&!storageReadable){
   alert('既存の保存データを保護するため、この画面からは変更できません。');
   return false;
  }
  const previous=JSON.stringify(db);
  const previousView=view;
  const previousSelection=selected;
- update();
- if(!persist()){
+ const restore=()=>{
   db=JSON.parse(previous);
   view=previousView;
   selected=previousSelection;
   hideModal();
   render();
-  return false;
+ };
+ update();
+ if(!account){
+  if(!persist()){restore();return false}
+ }else if(previous!==JSON.stringify(db)){
+  if(JSON.stringify(JSON.parse(previous).events)!==JSON.stringify(db.events)){
+   saveAccount(restore);
+  }else rememberAccountTimer(db.timer);
  }
  render();
  return true;
 }
+
+async function saveAccount(restore){
+ saving=true;
+ syncMessage='同期しています…';
+ try{
+  const response=await fetch('/api/journal',{
+   method:'PUT',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({...account,events:db.events}),
+   signal:AbortSignal.timeout(8000)
+  });
+  if(!response.ok){
+   if(response.status===409)throw Error('conflict');
+   if(response.status===401)throw Error('session');
+   throw Error('save');
+  }
+  account.revision=(await response.json()).revision;
+  rememberAccountTimer(db.timer);
+  syncMessage='同期しました。';
+  if(view==='settings'&&$('#modal').hidden)render();
+ }catch(error){
+  syncMessage=error.message==='conflict'?'別の端末またはタブで記録が更新されました。最新の記録を取得してから入力し直してください。'
+   :error.message==='session'?'ログインの有効期限が切れました。再読み込みしてからログインしてください。'
+   :'同期を確認できませんでした。最新の記録を取得してから、変更が反映されたか確認してください。';
+  restore();
+  alert(syncMessage);
+ }finally{saving=false}
+}
+
+function updatePrivacyLabel(){
+ const label=$('#storageLabel');
+ if(label)label.textContent=account?'Googleアカウントで同期':'この端末に保存';
+}
+
+async function logout(){
+ if(saving||checking)return;
+ checking=true;
+ try{
+  const response=await fetch('/api/auth/logout',{method:'POST'});
+  if(!response.ok)throw Error('logout');
+  rememberAccountTimer(null);
+  location.replace('/');
+ }catch{checking=false;alert('ログアウトできませんでした。接続を確認してください。')}
+}
+
+function importLocal(){
+ if(!account||!storageReadable)return;
+ const local=load().events;
+ if(!storageReadable)return;
+ if(!local.length){syncMessage='取り込める端末内の記録はありません。';render();return}
+ if(!confirm('この端末の記録をアカウントにコピーし、Cloudflareに保存しますか？'))return;
+ const known=new Set(db.events.map(e=>e.id));
+ commit(()=>{db.events.push(...local.filter(e=>!known.has(e.id)))});
+}
+
+function accountSettings(){
+ const controls=account
+  ? '<button class="btn ghost" id="refreshAccount">最新の記録を取得</button><button class="btn ghost" id="importLocal">端末内の記録を取り込む</button><button class="btn ghost" id="logoutAccount">ログアウト</button>'
+  : configured
+   ? '<a class="btn" href="/api/auth/login">Googleでログイン</a>'
+   : '<p class="small">Googleログインは現在利用できません。</p>';
+ return `<h2>アカウントと同期</h2><p class="small">${account?'Googleでログイン中です。アカウントの記録はCloudflareに保存され、同じアカウントでログインした端末から使えます。':'ログインせずに使えます。Googleでログインすると、そのアカウントで作成した記録が別の端末でも使えるようになります。同期する記録はCloudflareに保存されます。'} 未ログイン時の記録は、ログイン後に取り込みを選ぶまで端末内に残ります。</p><div class="btn-row">${controls}</div><p role="status" class="small">${safe(syncMessage)}</p><hr>`;
+}
 const durationOf=e=>e.sessions.reduce((s,x)=>s+x.minutes,0);
 const actionsTotal=e=>e.actions.reduce((s,a)=>s+a.minutes,0);
 const efind=id=>db.events.find(e=>e.id===id);
-function nav(to){view=to;selected=null;render();window.scrollTo(0,0);}
+function enterView(){
+ const content=$('#appContent');
+ window.scrollTo(0,0);
+ content.focus({preventScroll:true});
+ if(matchMedia('(prefers-reduced-motion: no-preference)').matches){
+  content.animate([{opacity:0,transform:'translateY(8px)'},{opacity:1,transform:'translateY(0)'}],
+   {duration:260,easing:'cubic-bezier(.2,.8,.2,1)'});
+ }
+}
+function nav(to){if(view===to&&!selected)return;view=to;selected=null;render();enterView();}
 function setNav(){document.querySelectorAll('[data-view]').forEach(b=>{b.classList.toggle('active',b.dataset.view===view);if(b.dataset.view===view)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');b.onclick=()=>nav(b.dataset.view)})}
-function page(sub,body){return `<h1 class="page-title">${sub[0]}</h1><p class="sub">${sub[1]}</p>${body}`}
-function eventRow(e){const done=e.predictions.filter(p=>p.outcome&&p.outcome!=='pending'&&p.outcome!=='unknown'&&p.outcome!=='unjudgeable').length;return `<div class="list-row click-row" data-open="${safe(e.id)}" tabindex="0" role="button"><div class="row-left"><div class="tiny-icon">${e.category==='仕事'?'▣':e.category==='健康'?'♡':'◈'}</div><div><strong>${safe(e.title)}</strong><p>${safe(e.category)} ・ ${e.predictions.length}件の波及効果 ・ ${date(e.eventAt)}</p></div></div><div style="text-align:right;flex-shrink:0"><span class="badge ${done?'':'gray'}">${done?`${done}件確認済み`:'確認待ち'}</span><div class="muted-line">› 詳細</div></div></div>`}
-function home(){const es=db.events;const min=es.reduce((s,e)=>s+durationOf(e),0);const act=es.reduce((s,e)=>s+actionsTotal(e),0);const pending=es.filter(e=>e.predictions.some(p=>!p.outcome||p.outcome==='pending'||p.outcome==='unknown'));return page(['気になることを、少しずつほどこう。','不安を記録し、準備と結果を振り返るための静かな場所です。'],`<div class="two-col"><section class="card hero"><h2>心配を、頭の外に出してみる。</h2><p>今日の気がかりを整理して、できることに目を向けましょう。</p><button class="btn white" id="newWorry">＋ 不安を記録する</button></section><section class="card"><div class="section-head" style="margin:0 0 15px"><h2>今の記録</h2><span class="badge gray">累計</span></div><div class="three-col" style="gap:8px"><div><div class="stat-label">不安の記録</div><div class="stat-num">${es.length}<small style="font-size:12px">件</small></div></div><div><div class="stat-label">反芻時間</div><div class="stat-num">${Math.round(min/60*10)/10}<small style="font-size:12px">h</small></div></div><div><div class="stat-label">行動時間</div><div class="stat-num">${Math.round(act/60*10)/10}<small style="font-size:12px">h</small></div></div></div><hr><p class="small">不安をなくすためではなく、振り回されずに過ごすための記録です。</p><button class="btn ghost sm" id="goInsights">分析を見る →</button></section></div><div class="two-col"><section><div class="section-head"><h2>最近の不安</h2><button class="btn ghost sm" id="allWorries">すべて見る →</button></div><div class="card">${es.length?es.slice().sort((a,b)=>b.createdAt.localeCompare(a.createdAt)).slice(0,4).map(eventRow).join(''):`<div class="empty"><div class="art">☁</div><strong>まだ記録はありません</strong><p>最初の不安をひとつ書き出してみましょう。波及する心配も一緒に整理できます。</p><button class="btn soft sm" id="emptyNew">はじめての記録</button></div>`}</div></section><section><div class="section-head"><h2>答え合わせ</h2><span class="small">予測と現実を見比べる</span></div><div class="card">${pending.length?pending.slice(0,4).map(e=>`<div class="list-row"><div><strong>${safe(e.title)}</strong><p>${e.predictions.filter(p=>!p.outcome||p.outcome==='pending'||p.outcome==='unknown').length}件の結果を確認できます</p></div><button class="btn soft sm" data-open="${safe(e.id)}">確認する</button></div>`).join(''):`<div class="empty"><div class="art">✓</div><strong>確認待ちの記録はありません</strong><p>イベント後に結果を入力すると、予測の傾向が見えてきます。</p></div>`}</div></section></div><p class="attention">ここはセルフケア用の記録ツールです。不安の強さや生活への支障が続く場合は、心理職・医療機関などへの相談も検討してください。</p>`)}
-function worries(){const es=db.events.slice().sort((a,b)=>b.createdAt.localeCompare(a.createdAt));return page(['不安の記録','出来事、考えていたこと、取った行動をまとめて確認できます。'],`<div class="btn-row" style="margin-bottom:20px"><button class="btn" id="newWorry">＋ 新しい不安を追加</button><span class="small">${es.length}件の記録</span></div><div class="card">${es.length?es.map(eventRow).join(''):`<div class="empty"><strong>まだ記録はありません</strong><p>気になることがあれば、今ここから記録できます。</p></div>`}</div>`)}
+function page(heading,body){
+ return `<div class="page-intro"><h1 class="page-title">${heading[0]}</h1>${heading[1]?`<p class="sub">${heading[1]}</p>`:''}</div>${body}`;
+}
+const byNewest=(a,b)=>b.createdAt.localeCompare(a.createdAt);
+const awaitingResult=p=>!p.outcome||p.outcome==='pending'||p.outcome==='unknown';
+
+function eventRow(e){
+ const complete=e.predictions.filter(p=>!awaitingResult(p)).length;
+ return `<button type="button" class="list-row click-row" data-open="${safe(e.id)}"><span class="row-left"><span class="tiny-icon" aria-hidden="true"></span><span><strong>${safe(e.title)}</strong><span class="row-meta">${safe(e.category)} · ${e.predictions.length}件の波及効果 · ${date(e.eventAt)}</span></span></span><span class="row-end">${e.predictions.length?`<span class="badge ${complete?'':'gray'}">${complete?complete+'件確認済み':'確認待ち'}</span>`:''}<span class="chevron" aria-hidden="true"></span></span></button>`;
+}
+
+function home(){
+ const es=db.events.slice().sort(byNewest);
+ const minutes=es.reduce((total,e)=>total+durationOf(e),0);
+ const actions=es.reduce((total,e)=>total+actionsTotal(e),0);
+ const pending=es.filter(e=>e.predictions.some(awaitingResult));
+ const active=efind(db.timer?.eventId);
+ return `<section class="hero">
+  <div class="hero-copy"><h1>不安の記録</h1><button class="btn" id="newWorry"><span class="plus" aria-hidden="true"></span>不安を記録</button></div>
+ </section>
+ ${active?`<section class="active-timer"><div><span class="small">計測中</span><strong>${safe(active.title)}</strong></div><button class="btn ghost" data-open="${safe(active.id)}">タイマーを開く</button></section>`:''}
+ <section class="overview">
+  <div class="section-head"><h2>記録の概要</h2><button class="text-btn" id="goInsights">分析を見る<span class="chevron" aria-hidden="true"></span></button></div>
+  <div class="overview-grid">
+   <div class="metric"><span class="stat-label">不安の記録</span><strong class="stat-num">${es.length}<span class="unit">件</span></strong></div>
+   <div class="metric"><span class="stat-label">反芻した時間</span><strong class="stat-num">${fmt(minutes)}</strong></div>
+   <div class="metric"><span class="stat-label">行動した時間</span><strong class="stat-num">${fmt(actions)}</strong></div>
+  </div>
+ </section>
+ <div class="home-collections">
+  <section><div class="section-head"><h2>最近の記録</h2>${es.length?`<button class="text-btn" id="allWorries">すべて見る<span class="chevron" aria-hidden="true"></span></button>`:''}</div><div class="card collection">${es.length?es.slice(0,4).map(eventRow).join(''):'<div class="empty">まだ記録がありません。</div>'}</div></section>
+  <section><div class="section-head"><h2>答え合わせ</h2></div><div class="card collection">${pending.length?pending.slice(0,4).map(e=>`<div class="list-row"><div><strong>${safe(e.title)}</strong><p>${e.predictions.filter(awaitingResult).length}件が確認待ち</p></div><button class="btn soft sm" data-open="${safe(e.id)}">結果を確認</button></div>`).join(''):'<div class="empty">確認待ちの記録はありません。</div>'}</div></section>
+ </div>`;
+}
+
+function recordList(){
+ recordTerm=$('#recordSearch').value;
+ recordCategory=$('#recordCategory').value;
+ const term=recordTerm.trim().normalize('NFKC').toLocaleLowerCase();
+ const category=recordCategory;
+ const matches=db.events.filter(e=>(!category||e.category===category)&&
+  (!term||[e.title,...e.predictions.map(p=>p.text)].some(t=>t.normalize('NFKC').toLocaleLowerCase().includes(term)))).sort(byNewest);
+ $('#recordMatches').textContent=matches.length+'件';
+ $('#recordList').innerHTML=matches.length?matches.map(eventRow).join(''):`<div class="empty">${db.events.length?'条件に合う記録はありません。':'まだ記録がありません。'}</div>`;
+}
+function worries(){
+ return page(['不安の記録'],`<div class="record-toolbar"><button class="btn" id="newWorry"><span class="plus" aria-hidden="true"></span>不安を記録</button><label class="record-search"><span class="search-icon" aria-hidden="true"></span><input type="search" id="recordSearch" aria-label="記録を検索" placeholder="記録を検索"></label><select id="recordCategory" aria-label="カテゴリで絞り込む"><option value="">全カテゴリ</option>${categories.map(c=>`<option>${c}</option>`).join('')}</select></div><p class="small result-count" id="recordMatches" role="status"></p><div class="card collection" id="recordList"></div>`);
+}
 function outcomeBadge(p){return `<span class="badge ${p.outcome==='yes'||p.outcome==='partial'?'orange':p.outcome==='no'?'':'gray'}">${outcomes[p.outcome||'pending']}</span>`}
-function detail(e){const tm=durationOf(e),action=actionsTotal(e),effective=e.actions.filter(a=>a.review?.reuse===true).reduce((s,a)=>s+a.minutes,0);return `<button class="back" id="backList">← 一覧へ戻る</button><div class="detail-head"><div><h2>${safe(e.title)}</h2><div class="small">${safe(e.category)} ・ ${date(e.eventAt)} ・ 不安強度 ${e.intensity}/10</div></div><button class="btn ghost sm" id="editWorry">編集</button></div><div class="three-col" style="margin:25px 0 0"><div class="card"><div class="stat-label">反芻した時間</div><div class="stat-num">${fmt(tm)}</div></div><div class="card"><div class="stat-label">取った行動</div><div class="stat-num">${e.actions.length}件</div><div class="stat-hint">${fmt(action)} 実行</div></div><div class="card"><div class="stat-label">次回も使いたい行動</div><div class="stat-num">${fmt(effective)}</div><div class="stat-hint">自己評価による</div></div></div><div class="section-head"><h2>想定する波及効果</h2><button class="btn soft sm" id="addPrediction">＋ 波及効果を追加</button></div><section class="card">${e.predictions.length?e.predictions.map((p,i)=>`<div class="prediction"><div class="prediction-top"><strong>${i+1}. ${safe(p.text)}</strong>${outcomeBadge(p)}</div><p class="small" style="margin:6px 0 10px">事前予測：${p.probability==null?'未設定':safe(p.probability)+'%'} ${p.outcomeNote?`・ 実際：${safe(p.outcomeNote)}`:''}</p><div class="btn-row"><button class="btn ghost sm" data-review-pred="${safe(p.id)}">結果を記録・修正</button><button class="btn ghost sm" data-edit-pred="${safe(p.id)}">編集</button></div></div>`).join(''):`<p class="small">起こると心配している波及効果を追加できます。無理に増やす必要はありません。</p>`}</section><div class="section-head"><h2>反芻した時間</h2><div class="btn-row"><button class="btn ghost sm" id="addRumination">＋ 手動</button><button class="btn soft sm" id="startTimer">◷ タイマー</button></div></div>${timerBlock(e)}<section class="card">${e.sessions.length?e.sessions.slice().reverse().map(s=>`<div class="list-row"><div><strong>${fmt(s.minutes)}</strong><p>${s.method==='timer'?'タイマー':'手動'} ・ ${date(s.createdAt)} ${s.note?'・ '+safe(s.note):''}</p></div><button class="btn ghost sm" data-delete-session="${safe(s.id)}">削除</button></div>`).join(''):`<div class="empty"><strong>反芻時間はまだありません</strong><p>考え続けていた時間を、概算でも記録できます。</p></div>`}</section><div class="section-head"><h2>実行したアクション</h2><button class="btn soft sm" id="addAction">＋ アクションを追加</button></div><section class="card">${e.actions.length?e.actions.map(a=>`<div class="list-row"><div style="max-width:75%"><strong>${safe(a.title)}</strong><p>${fmt(a.minutes)} ・ ${actionKinds[a.kind]||'その他'}${a.purpose?' ・ 目的：'+safe(a.purpose):''}</p><p>${a.review?`不安軽減 ${a.review.relief===null?'未評価':a.review.relief+'/5'} ／ 結果への貢献 ${a.review.contribution===null?'未評価':a.review.contribution+'/5'} ／ 次回 ${a.review.reuse===true?'使いたい':a.review.reuse===false?'見直す':'未判断'}`:'事後評価はまだありません'}</p></div><div class="btn-row"><button class="btn ghost sm" data-review-action="${safe(a.id)}">評価</button><button class="btn ghost sm" data-edit-action="${safe(a.id)}">編集</button></div></div>`).join(''):`<div class="empty"><strong>行動の記録はありません</strong><p>準備・練習・相談など、実際に行ったことを記録しましょう。</p></div>`}</section><div class="section-head"><h2>今回の学び</h2></div><div class="card"><p class="small">結果が出てから、次回も役立ちそうな行動を振り返れます。予測が外れても、実際に起きても、自分を責めずに確認しましょう。</p><div class="btn-row"><button class="btn ghost sm" id="deleteEvent">この記録を削除</button></div></div>`}
+function detail(e){const tm=durationOf(e),action=actionsTotal(e),effective=e.actions.filter(a=>a.review?.reuse===true).reduce((s,a)=>s+a.minutes,0);return `<button class="back" id="backList">一覧へ戻る</button><div class="detail-head"><div><h2>${safe(e.title)}</h2><div class="small">${safe(e.category)} ・ ${date(e.eventAt)} ・ 不安強度 ${e.intensity}/10</div></div><button class="btn ghost sm" id="editWorry">編集</button></div><div class="three-col" style="margin:25px 0 0"><div class="card"><div class="stat-label">反芻した時間</div><div class="stat-num">${fmt(tm)}</div></div><div class="card"><div class="stat-label">取った行動</div><div class="stat-num">${e.actions.length}件</div><div class="stat-hint">${fmt(action)} 実行</div></div><div class="card"><div class="stat-label">次回も使いたい行動</div><div class="stat-num">${fmt(effective)}</div><div class="stat-hint">自己評価による</div></div></div><div class="section-head"><h2>想定する波及効果</h2><button class="btn soft sm" id="addPrediction">波及効果を追加</button></div><section class="card">${e.predictions.length?e.predictions.map((p,i)=>`<div class="prediction"><div class="prediction-top"><strong>${i+1}. ${safe(p.text)}</strong>${outcomeBadge(p)}</div><p class="small" style="margin:6px 0 10px">事前予測：${p.probability==null?'未設定':safe(p.probability)+'%'} ${p.outcomeNote?`・ 実際：${safe(p.outcomeNote)}`:''}</p><div class="btn-row"><button class="btn ghost sm" data-review-pred="${safe(p.id)}">結果を記録・修正</button><button class="btn ghost sm" data-edit-pred="${safe(p.id)}">編集</button></div></div>`).join(''):`<p class="small">起こると心配している波及効果を追加できます。</p>`}</section><div class="section-head"><h2>反芻した時間</h2><div class="btn-row"><button class="btn ghost sm" id="addRumination">手動で追加</button><button class="btn soft sm" id="startTimer">タイマーを開始</button></div></div>${timerBlock(e)}<section class="card">${e.sessions.length?e.sessions.slice().reverse().map(s=>`<div class="list-row"><div><strong>${fmt(s.minutes)}</strong><p>${s.method==='timer'?'タイマー':'手動'} ・ ${date(s.createdAt)} ${s.note?'・ '+safe(s.note):''}</p></div><button class="btn ghost sm" data-delete-session="${safe(s.id)}">削除</button></div>`).join(''):`<div class="empty"><strong>反芻時間はまだありません</strong><p>考え続けていた時間を、概算でも記録できます。</p></div>`}</section><div class="section-head"><h2>実行したアクション</h2><button class="btn soft sm" id="addAction">アクションを追加</button></div><section class="card">${e.actions.length?e.actions.map(a=>`<div class="list-row"><div style="max-width:75%"><strong>${safe(a.title)}</strong><p>${fmt(a.minutes)} ・ ${actionKinds[a.kind]||'その他'}${a.purpose?' ・ 目的：'+safe(a.purpose):''}</p><p>${a.review?`不安軽減 ${a.review.relief===null?'未評価':a.review.relief+'/5'} ／ 結果への貢献 ${a.review.contribution===null?'未評価':a.review.contribution+'/5'} ／ 次回 ${a.review.reuse===true?'使いたい':a.review.reuse===false?'見直す':'未判断'}`:'事後評価はまだありません'}</p></div><div class="btn-row"><button class="btn ghost sm" data-review-action="${safe(a.id)}">評価</button><button class="btn ghost sm" data-edit-action="${safe(a.id)}">編集</button></div></div>`).join(''):`<div class="empty"><strong>行動の記録はありません</strong><p>準備・練習・相談など、実際に行ったことを記録しましょう。</p></div>`}</section><div class="section-head"><h2>記録の管理</h2></div><div class="card"><p class="small">記録を削除すると、関連する予測・反芻時間・アクションも削除されます。</p><div class="btn-row"><button class="btn ghost sm" id="deleteEvent">この記録を削除</button></div></div>`}
 function timerBlock(e){const t=db.timer;if(!t)return '';if(t.eventId!==e.id)return `<div class="note">別の不安でタイマーが動作中です。そちらで終了してから使えます。</div>`;const secs=Math.floor((Date.now()-new Date(t.startedAt).getTime())/1000);return `<div class="timer-live"><div><small>反芻タイマー記録中</small><strong id="timerClock">${clock(Math.max(0,secs))}</strong></div><button class="btn sm" id="stopTimer">終了して確認</button></div>`}
 const clock=s=>`${String(Math.floor(s/3600)).padStart(2,'0')}:${String(Math.floor(s%3600/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
-function insights(){const es=db.events;const rum=es.reduce((s,e)=>s+durationOf(e),0);const act=es.reduce((s,e)=>s+actionsTotal(e),0);const useful=es.reduce((s,e)=>s+e.actions.filter(a=>a.review?.reuse===true).reduce((r,a)=>r+a.minutes,0),0);const preds=es.flatMap(e=>e.predictions);const counts={yes:0,partial:0,no:0,unknown:0};preds.forEach(p=>{if(counts[p.outcome]!==undefined)counts[p.outcome]++});const byCat=categories.map(c=>({name:c,minutes:es.filter(e=>e.category===c).reduce((s,e)=>s+durationOf(e),0)})).filter(x=>x.minutes>0);const max=Math.max(1,...byCat.map(x=>x.minutes));return page(['心配の傾向を、少しずつ知る。','数値は自分を評価するためではなく、次の行動を選びやすくするためのものです。'],`<div class="three-col"><div class="card"><div class="stat-label">反芻に使った時間</div><div class="stat-num">${fmt(rum)}</div><div class="stat-hint">概算を含む累計</div></div><div class="card"><div class="stat-label">実行した行動の時間</div><div class="stat-num">${fmt(act)}</div><div class="stat-hint">準備・練習・相談など</div></div><div class="card"><div class="stat-label">次回も使いたい行動</div><div class="stat-num">${fmt(useful)}</div><div class="stat-hint">イベント後の自己評価</div></div></div><div class="two-col" style="margin-top:18px"><div class="card"><h2>波及効果の現実化</h2><p class="small">予測ごとに、実際の結果を集計しています。</p><div style="display:grid;gap:12px;margin-top:23px">${[{key:'yes',name:'起きた',color:'#cf967b'},{key:'partial',name:'一部起きた',color:'#e7bb82'},{key:'no',name:'起きなかった',color:'#77b79c'},{key:'unknown',name:'まだ不明',color:'#becdc5'}].map(x=>`<div><div class="subline"><span>${x.name}</span><strong>${counts[x.key]}件</strong></div><div class="meter"><div style="width:${Math.round(counts[x.key]/Math.max(preds.length,1)*100)}%;background:${x.color}"></div></div></div>`).join('')}</div><p class="muted-line">確認前・判定不能は上記に含めていません。予測が外れたこと自体を成功と決めつけません。</p></div><div class="card"><h2>カテゴリ別の反芻時間</h2><p class="small">どのテーマに時間を使っていたかを確認できます。</p>${byCat.length?`<div class="chart-bars">${byCat.map(x=>`<div class="bar-col"><em>${x.minutes}分</em><div style="height:${Math.max(x.minutes/max*100,2)}%"></div><span>${x.name}</span></div>`).join('')}</div>`:`<div class="empty"><div class="art">▥</div><p>記録が集まると表示されます</p></div>`}</div></div><div class="section-head"><h2>次回に引き継ぎたい行動</h2></div><div class="card">${es.flatMap(e=>e.actions.filter(a=>a.review?.reuse===true).map(a=>({...a,eventTitle:e.title}))).slice(-7).reverse().map(a=>`<div class="list-row"><div><strong>${safe(a.title)}</strong><p>${safe(a.eventTitle)} ・ ${fmt(a.minutes)}</p></div><span class="badge">次回も使いたい</span></div>`).join('')||`<div class="empty"><p>イベント終了後にアクションを評価すると、ここに表示されます。</p></div>`}</div><div class="attention">「役立った時間」は行動についての自己評価であり、結果との因果関係を証明するものではありません。休息や何もしない時間も大切です。</div>`)}
-function settings(){return page(['設定とデータ管理','記録は現在のブラウザ内だけに保存されます。'],`<section class="card"><h2>プライバシー</h2><p class="small">ログイン・クラウド同期・外部AI送信はありません。データはこの端末のブラウザのlocalStorageに保存され、サイトデータの削除や端末変更では失われる場合があります。共有端末での入力は避けてください。</p><div class="btn-row"><button class="btn ghost" id="exportData">記録をJSONで書き出す</button><button class="btn danger" id="clearData">すべての記録を削除</button></div><hr><h2>セルフケアに関する注意</h2><p class="small">moyanは医療機器・診断・治療サービスではありません。不安が長く続く、眠れない、生活に支障が出る場合は医師や心理専門職への相談を検討してください。差し迫った危険がある場合は地域の緊急サービスへ連絡してください。</p></section>`)}
-function render(){setNav();$('#appContent').innerHTML=selected&&view==='worries'&&efind(selected)?detail(efind(selected)):{home,worries,insights,settings}[view]();document.querySelectorAll('[data-open]').forEach(el=>{const open=()=>{selected=el.dataset.open;view='worries';render();window.scrollTo(0,0);$('#appContent').focus({preventScroll:true})};el.onclick=open;if(el.tagName!=='BUTTON')el.onkeydown=ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();open()}}});const bind=(id,fn)=>{const el=$('#'+id);if(el)el.onclick=fn};bind('newWorry',()=>eventForm());bind('emptyNew',()=>eventForm());bind('allWorries',()=>nav('worries'));bind('goInsights',()=>nav('insights'));if(selected&&view==='worries'){const e=efind(selected);bind('backList',()=>{nav('worries')});bind('editWorry',()=>eventForm(e));bind('addPrediction',()=>predictionForm(e));bind('addRumination',()=>rumForm(e));bind('addAction',()=>actionForm(e));bind('startTimer',()=>startTimer(e));bind('stopTimer',()=>stopTimer(e));bind('deleteEvent',()=>{if(confirm('この不安とすべての関連記録を削除しますか？'))commit(()=>{db.events=db.events.filter(x=>x.id!==e.id);if(db.timer?.eventId===e.id)db.timer=null;selected=null})});document.querySelectorAll('[data-review-pred]').forEach(b=>b.onclick=()=>predictionReview(e,b.dataset.reviewPred));document.querySelectorAll('[data-edit-pred]').forEach(b=>b.onclick=()=>predictionForm(e,b.dataset.editPred));document.querySelectorAll('[data-review-action]').forEach(b=>b.onclick=()=>actionReview(e,b.dataset.reviewAction));document.querySelectorAll('[data-edit-action]').forEach(b=>b.onclick=()=>actionForm(e,b.dataset.editAction));document.querySelectorAll('[data-delete-session]').forEach(b=>b.onclick=()=>{if(confirm('この反芻記録を削除しますか？'))commit(()=>e.sessions=e.sessions.filter(x=>x.id!==b.dataset.deleteSession))})}bind('exportData',exportData);bind('clearData',()=>{if(confirm('すべての記録が削除され、元に戻せません。削除しますか？'))commit(()=>{db=initial();selected=null})})}
-function showModal(html,init){modalTrigger=document.activeElement;$('#modalContent').innerHTML=`<div class="modal-head"><h2 id="modalTitle">${html.title}</h2><button class="close" id="closeModal" type="button" aria-label="閉じる">✕</button></div>${html.body}`;$('#modal').hidden=false;$('#closeModal').onclick=hideModal;$('.app').inert=true;document.body.classList.add('modal-open');init?.();$('#modalContent').focus({preventScroll:true})}
+function insights(){const es=db.events;const rum=es.reduce((s,e)=>s+durationOf(e),0);const act=es.reduce((s,e)=>s+actionsTotal(e),0);const useful=es.reduce((s,e)=>s+e.actions.filter(a=>a.review?.reuse===true).reduce((r,a)=>r+a.minutes,0),0);const preds=es.flatMap(e=>e.predictions);const counts={yes:0,partial:0,no:0,unknown:0};preds.forEach(p=>{if(counts[p.outcome]!==undefined)counts[p.outcome]++});const byCat=categories.map(c=>({name:c,minutes:es.filter(e=>e.category===c).reduce((s,e)=>s+durationOf(e),0)})).filter(x=>x.minutes>0);const max=Math.max(1,...byCat.map(x=>x.minutes));return page(['分析'],`<div class="three-col"><div class="card"><div class="stat-label">反芻に使った時間</div><div class="stat-num">${fmt(rum)}</div><div class="stat-hint">概算を含む累計</div></div><div class="card"><div class="stat-label">実行した行動の時間</div><div class="stat-num">${fmt(act)}</div><div class="stat-hint">準備・練習・相談など</div></div><div class="card"><div class="stat-label">次回も使いたい行動</div><div class="stat-num">${fmt(useful)}</div><div class="stat-hint">イベント後の自己評価</div></div></div><div class="two-col" style="margin-top:18px"><div class="card"><h2>波及効果の現実化</h2><p class="small">予測ごとに、実際の結果を集計しています。</p><div style="display:grid;gap:12px;margin-top:23px">${[{key:'yes',name:'起きた',color:'#0071e3'},{key:'partial',name:'一部起きた',color:'#2997ff'},{key:'no',name:'起きなかった',color:'#0066cc'},{key:'unknown',name:'まだ不明',color:'#768699'}].map(x=>`<div><div class="subline"><span>${x.name}</span><strong>${counts[x.key]}件</strong></div><div class="meter"><div style="width:${Math.round(counts[x.key]/Math.max(preds.length,1)*100)}%;background:${x.color}"></div></div></div>`).join('')}</div><p class="muted-line">確認前・判定不能は上記に含めていません。</p></div><div class="card"><h2>カテゴリ別の反芻時間</h2><p class="small">どのテーマに時間を使っていたかを確認できます。</p>${byCat.length?`<div class="chart-bars">${byCat.map(x=>`<div class="bar-col"><em>${x.minutes}分</em><div style="height:${Math.max(x.minutes/max*100,2)}%"></div><span>${x.name}</span></div>`).join('')}</div>`:`<div class="empty">反芻時間の記録はありません。</div>`}</div></div><div class="section-head"><h2>次回に引き継ぎたい行動</h2></div><div class="card">${es.flatMap(e=>e.actions.filter(a=>a.review?.reuse===true).map(a=>({...a,eventTitle:e.title}))).slice(-7).reverse().map(a=>`<div class="list-row"><div><strong>${safe(a.title)}</strong><p>${safe(a.eventTitle)} ・ ${fmt(a.minutes)}</p></div><span class="badge">次回も使いたい</span></div>`).join('')||`<div class="empty"><p>イベント終了後にアクションを評価すると、ここに表示されます。</p></div>`}</div><div class="attention">「役立った時間」は行動についての自己評価であり、結果との因果関係を証明するものではありません。休息や何もしない時間も大切です。</div>`)}
+function settings(){return page(['設定'],`<section class="card">${accountSettings()}<h2>プライバシー</h2><p class="small">記録をGoogleに送信することはありません。未ログイン時の記録は、このブラウザのサイトデータを削除すると失われる場合があります。共有端末では利用後にログアウトしてください。</p><div class="btn-row"><button class="btn ghost" id="exportData">記録をJSONで書き出す</button><button class="btn danger" id="clearData">すべての記録を削除</button></div><hr><h2>セルフケアに関する注意</h2><p class="small">moyanは医療機器・診断・治療サービスではありません。不安が長く続く、眠れない、生活に支障が出る場合は医師や心理専門職への相談を検討してください。差し迫った危険がある場合は地域の緊急サービスへ連絡してください。</p></section>`)}
+function render(){setNav();$('#appContent').innerHTML=selected&&view==='worries'&&efind(selected)?detail(efind(selected)):{home,worries,insights,settings}[view]();if($('#recordList')){
+ $('#recordSearch').value=recordTerm;
+ $('#recordCategory').value=recordCategory;
+ recordList();
+ $('#recordSearch').oninput=recordList;
+ $('#recordCategory').onchange=recordList;
+ }
+ const bind=(id,fn)=>{const el=$('#'+id);if(el)el.onclick=fn};bind('newWorry',()=>eventForm());bind('emptyNew',()=>eventForm());bind('allWorries',()=>nav('worries'));bind('goInsights',()=>nav('insights'));if(selected&&view==='worries'){const e=efind(selected);bind('backList',()=>{nav('worries')});bind('editWorry',()=>eventForm(e));bind('addPrediction',()=>predictionForm(e));bind('addRumination',()=>rumForm(e));bind('addAction',()=>actionForm(e));bind('startTimer',()=>startTimer(e));bind('stopTimer',()=>stopTimer(e));bind('deleteEvent',()=>{if(confirm('この不安とすべての関連記録を削除しますか？'))commit(()=>{db.events=db.events.filter(x=>x.id!==e.id);if(db.timer?.eventId===e.id)db.timer=null;selected=null})});document.querySelectorAll('[data-review-pred]').forEach(b=>b.onclick=()=>predictionReview(e,b.dataset.reviewPred));document.querySelectorAll('[data-edit-pred]').forEach(b=>b.onclick=()=>predictionForm(e,b.dataset.editPred));document.querySelectorAll('[data-review-action]').forEach(b=>b.onclick=()=>actionReview(e,b.dataset.reviewAction));document.querySelectorAll('[data-edit-action]').forEach(b=>b.onclick=()=>actionForm(e,b.dataset.editAction));document.querySelectorAll('[data-delete-session]').forEach(b=>b.onclick=()=>{if(confirm('この反芻記録を削除しますか？'))commit(()=>e.sessions=e.sessions.filter(x=>x.id!==b.dataset.deleteSession))})}bind('refreshAccount',()=>refreshAccount(true));bind('importLocal',importLocal);bind('logoutAccount',logout);bind('exportData',exportData);bind('clearData',()=>{if(confirm(account?'アカウントの記録をすべて削除しますか？ 同期している端末にも反映されます。':'このブラウザ内の記録をすべて削除しますか？'))commit(()=>{db=initial();selected=null})})}
+function showModal(html,init){modalTrigger=document.activeElement;$('#modalContent').innerHTML=`<div class="modal-head"><h2 id="modalTitle">${html.title}</h2><button class="close" id="closeModal" type="button" aria-label="閉じる"><span class="close-icon" aria-hidden="true"></span></button></div>${html.body}`;$('#modal').hidden=false;$('#closeModal').onclick=hideModal;$('.app').inert=true;document.body.classList.add('modal-open');init?.();$('#modalContent').focus({preventScroll:true})}
 function hideModal(){
   if($('#modal').hidden)return;
   $('#modal').hidden=true;
@@ -72,5 +252,15 @@ function actionForm(e,id){const a=e.actions.find(x=>x.id===id);showModal({title:
 function actionReview(e,id){const a=e.actions.find(x=>x.id===id);if(!a)return;showModal({title:'アクションの有効性を評価',body:`<form id="ar-form"><div class="note" style="margin-bottom:15px">${safe(a.title)} ・ ${fmt(a.minutes)}<br>効果は自己評価です。結果への貢献を断定するものではありません。</div><div class="form-grid"><div class="field"><label for="ar-relief">不安の軽減への役立ち度</label><select id="ar-relief"><option value="">未評価</option>${Array.from({length:6},(_,i)=>`<option value="${i}" ${a.review?.relief===i?'selected':''}>${i} / 5</option>`).join('')}</select></div><div class="field"><label for="ar-contrib">実際の結果への貢献</label><select id="ar-contrib"><option value="">未評価</option>${Array.from({length:6},(_,i)=>`<option value="${i}" ${a.review?.contribution===i?'selected':''}>${i} / 5</option>`).join('')}</select></div></div><div class="field"><label for="ar-reuse">次回も実施したいですか？</label><select id="ar-reuse"><option value="" ${a.review?.reuse==null?'selected':''}>まだわからない</option><option value="yes" ${a.review?.reuse===true?'selected':''}>次回も使いたい</option><option value="no" ${a.review?.reuse===false?'selected':''}>次回は見直したい</option></select></div><div class="field"><label for="ar-note">理由・学び（任意）</label><textarea id="ar-note" maxlength="400" placeholder="実際にどう役立ったか、次回の改善点">${safe(a.review?.reason||'')}</textarea></div><button type="submit" class="btn full">有効性を保存</button></form>`},()=>{$('#ar-form').onsubmit=ev=>{ev.preventDefault();const n=v=>v===''?null:Number(v);commit(()=>a.review={relief:n($('#ar-relief').value),contribution:n($('#ar-contrib').value),reuse:$('#ar-reuse').value===''?null:$('#ar-reuse').value==='yes',reason:$('#ar-note').value.trim(),reviewedAt:new Date().toISOString()});hideModal()}})}
 function exportData(){const blob=new Blob([JSON.stringify(db,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`moyan-backup-${new Date().toISOString().slice(0,10)}.json`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000)}
 setInterval(()=>{if(db.timer){const el=$('#timerClock');if(el)el.textContent=clock(Math.max(0,Math.floor((Date.now()-new Date(db.timer.startedAt).getTime())/1000)))}},1000);
+$('#appContent').addEventListener('click',event=>{
+ const opener=event.target.closest('[data-open]');
+ if(!opener)return;
+ selected=opener.dataset.open;
+ view='worries';
+ render();
+ enterView();
+});
 render();
+refreshAccount();
+window.addEventListener('focus',()=>refreshAccount());
 })();
